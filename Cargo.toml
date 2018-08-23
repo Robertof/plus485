@@ -1,0 +1,12 @@
+[package]
+name = "plus485"
+version = "0.1.0"
+authors = ["Roberto Frenna <roberto.frenna@gmail.com>"]
+
+[dependencies]
+clap = "2.32"
+futures = "0.1"
+tokio-core = "0.1"
+tokio-serial = "0.8"
+# TODO: remove feature "tcp" once version 0.2.2 is pushed to crates.io
+tokio-modbus = { version = "0.2", default-features = false, features = ["tcp", "rtu", "sync"] }
