@@ -324,7 +324,7 @@ impl OutputFormat {
     }
 
     // Ensures a newline is printed when using OutputFormat::Compact.
-    fn finish (&self) {
+    fn ensure_newline (&self) {
         if let OutputFormat::Compact = *self {
             println!("")
         }
@@ -484,9 +484,17 @@ fn read_from_meter(
     args: &clap::ArgMatches,
     mut to_fetch: Vec<QualifiedRegister>
 ) {
+    // Serial communication is unstable and sometimes dies/timeouts with no reasons.
+    // As such, there are two retry mechanisms implemented:
+    // - a basic timeout-then-retry implemented in read_from_meter_impl (up to 2 tries)
+    // - a mechanism which actually closes and reopens the serial interface after 100ms and
+    //   tries to read the data again (up to 3 tries), implemented here.
     let mut try_count = 1_u8;
+    // This RefCell keeps track of the already processed items - it allows to remove them from
+    // `to_fetch` before retrying.
     let processed_items = RefCell::new (0);
     let output_format = OutputFormat::from_args (&args);
+    // Keep calling `read_from_meter_impl` until we do not receive an error.
     while let Err(error) = read_from_meter_impl (
         &args, &to_fetch[..], &processed_items, &output_format
     ) {
@@ -496,26 +504,29 @@ fn read_from_meter(
             Error(ErrorKind::Io(ref error), _)
                 if error.kind() == io::ErrorKind::TimedOut && try_count <= 3 =>
             {
+                // Remove already processed items from `to_fetch`
                 to_fetch.drain (0..*processed_items.borrow());
                 *processed_items.borrow_mut() = 0;
                 try_count += 1;
                 // Give enough time to let the serial interface recover.
                 thread::sleep (Duration::from_millis (100));
             },
+            // TODO: we may want to catch and retry on "broken pipe" errors too. They seem to
+            // happen quite frequently.
             Error(ErrorKind::Io(_), _) => {
-                output_format.finish();
+                output_format.ensure_newline();
                 eprintln!("{}",
                     error.chain_err (|| "can't retrieve data from modbus").display_chain());
                 process::exit (1);
             },
             _ => {
-                output_format.finish();
+                output_format.ensure_newline();
                 eprintln!("{}", error.display_chain());
                 process::exit (1);
             }
         }
     }
-    output_format.finish();
+    output_format.ensure_newline();
 }
 
 fn read_from_meter_impl(
@@ -524,30 +535,48 @@ fn read_from_meter_impl(
     processed_items: &RefCell<usize>,
     output_format: &OutputFormat
 ) -> Result<()> {
+    // Configure the serial port we're going to use.
     let settings = SerialPortSettings {
         baud_rate: tokio_serial::BaudRate::Baud4800,
         stop_bits: tokio_serial::StopBits::Two,
         ..Default::default()
     };
-    let mut core = tokio_core::reactor::Core::new().unwrap();
+    // Create a tokio reactor.
+    let mut core = tokio_core::reactor::Core::new().chain_err (|| "can't create tokio reactor")?;
     let handle = core.handle();
     #[allow(unused_mut)] // for win32
     let mut port = Serial::from_path_with_handle (
-        args.value_of ("serial_port").unwrap(),
+        args.value_of ("serial_port").unwrap(), // this is safe - it's a mandatory argument
         &settings,
         &handle.new_tokio_handle()
     ).chain_err (|| "unable to open requested serial port")?;
     #[cfg(unix)]
     port.set_exclusive (false).chain_err (|| "unable to set port exclusivity")?;
     let mut client: Option<tokio_modbus::Client> = None;
+    // Create the future.
     let task = tokio_modbus::Client::connect_rtu (
         port,
         args.value_of ("address").unwrap().parse().unwrap(), // safe
         &handle
     ).and_then (|local_client| {
+        // The following is an unfortunate, required hack due to the various nesting closures used
+        // to handle retries and so on:
+        // - directly using `client` is not possible as it would either cause a move on an FnMut
+        //   closure (which is forbidden), or a borrow with an insufficient lifetime
+        // - using a RefCell would only be useful outside of this closure's scope, but we can't do
+        //   it as the client is only defined at this step.
+        // Option<T> - initially None - allows us to define it here and then use client.as_ref()
+        // to obtain a valid borrow (without any kind of moving) inside the nested closures.
         client = Some(local_client);
+        // We "convert" `to_fetch` to a stream of Future<Item = (), Error = io::Error> values.
+        // `for_each` executes each promises and most importantly only executes the next one when
+        // the previous is completed. Concurrent access does not work.
         futures::stream::iter_ok::<_, io::Error>(to_fetch).for_each (|register| {
+            // To handle retries, loop until either we succeed or we reach the maximum number of
+            // tries. We pass `register` as an argument to avoid the moving issues yet again.
             futures::future::loop_fn ((register, 1), |(register, tries)| {
+                // Try to read the requested register (and quantity) with a maximum timeout of
+                // 200ms.
                 Timeout::new (
                     client.as_ref().unwrap().read_input_registers (
                         register.number() as u16,
@@ -555,6 +584,8 @@ fn read_from_meter_impl(
                     ),
                     Duration::from_millis (200)
                 )
+                // Since this must return an io::Error, convert errors returned by tokio_timer
+                // to an appopriate type.
                 .map_err (|e|
                     if e.is_elapsed() {
                         io::ErrorKind::TimedOut.into()
@@ -566,8 +597,10 @@ fn read_from_meter_impl(
                 )
                 .then (move |val| {
                     match val {
+                        // If we timed out and we are allowed to, return Loop::Continue and retry.
                         Err(ref error) if error.kind() == io::ErrorKind::TimedOut => {
                             if tries >= 2 {
+                                // Otherwise, just propagate the `timed out` error.
                                 Err(io::ErrorKind::TimedOut.into())
                             } else {
                                 Ok(Loop::Continue((register, tries + 1)))
@@ -575,17 +608,22 @@ fn read_from_meter_impl(
                         },
                         Err(error) => Err(error),
                         Ok(ref result) => {
+                            // If we succeeded, display the read data using the requested
+                            // `output_format` and stop the loop.
                             output_format.display (register.decode_value (result), register);
                             Ok(Loop::Break(()))
                         }
                     }
                 })
             }).and_then (|_| {
+                // If and only if we successfully retrieved a value, increase the total number
+                // of processed items.
                 *processed_items.borrow_mut() += 1;
                 Ok(())
             })
         })
     });
+    // Run the task.
     core.run (task)?;
     Ok(())
 }
