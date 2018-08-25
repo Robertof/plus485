@@ -8,5 +8,10 @@ clap = "2.32"
 futures = "0.1"
 tokio-core = "0.1"
 tokio-serial = "0.8"
-# TODO: remove feature "tcp" once version 0.2.2 is pushed to crates.io
-tokio-modbus = { version = "0.2", default-features = false, features = ["tcp", "rtu", "sync"] }
+tokio-modbus = { version = "0.2.2", default-features = false, features = ["rtu", "sync"] }
+error-chain = "0.12"
+tokio-timer = "0.2.6"
+
+[patch.crates-io]
+# Use the latest version of tokio-modbus
+tokio-modbus = { git = "https://github.com/slowtec/tokio-modbus" }
