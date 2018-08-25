@@ -52,6 +52,28 @@ mod num_utils {
     pub fn is_negative (number: u16) -> bool { number >> 15 == 1 }
     #[inline]
     pub fn signum (number: u16) -> i8 { if is_negative(number) { -1 } else { 1 } }
+
+    #[test]
+    fn test_bcd_decoding() {
+        assert_eq!(decode_bcd (0x0221,     3), 221);
+        assert_eq!(decode_bcd (0x0708,     3), 708);
+        assert_eq!(decode_bcd (0x8082,     3), 82);
+        assert_eq!(decode_bcd (0x00748202, 8), 748202);
+    }
+
+    #[test]
+    fn test_exponent_decoding() {
+        assert_eq!(decode_exponent (0), 0);
+        assert_eq!(decode_exponent (0xFFFF), -1);
+        assert_eq!(decode_exponent (0xFFFE), -2);
+    }
+
+    #[test]
+    fn test_signum() {
+        assert!(is_negative (0x8000));
+        assert_eq!(signum (0x8000), -1);
+        assert_eq!(signum (0x1), 1);
+    }
 }
 
 use errors::*;
